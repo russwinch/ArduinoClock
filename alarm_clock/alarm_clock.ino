@@ -1,3 +1,4 @@
+
 /* CLOCK v4
    Russ Winch
    Started February 2016
@@ -7,32 +8,34 @@
    Hardware
     breadboard arduino
     usb power
+    jumper to select between usb power or ICSP
+    switch or jumper to disable sound
 
    Software
     improve alarm tones
     add negative for temperature
-    add extra alarms
-    settings mode for alarm tone and snooze time and 12/24h mode?
-    write settings to ATMEGA EEPROM
+    settings mode for alarm tone
+    settings mode for 12/24h mode?
     automatically exit settings mode if no buttons pressed for a while
     combine dots into the updateLeds function?
-
-   Alarms
-    all alarm times stored in EEPROM
-    show/set snooze time at end of alarms loop
+    ensure all variables are initialised(!!)
 
    Bugs
     confirmFlash continues even when mode is changed
     so many instances of changedMode added - are they all necessary?
     changed mode detection resets if another button released - eg pressing al when still holding snooze
-    
-    
-    
+    changing the number of alarms causes mins and hours to be mixed up and other bad stuff - does this actually need to be available as a setting!?
+    retriving mins from one of the alarm changes to 24 during reset...
+    quick changing alarm results in release being picked up and displaying the next alarm on release - only detect a release after a press, not hold?
+    holding al switch to display alarm caused it to jump between alarm and time on release - change to press and dont change back whilst held
+
 */
 
 
+
 #define DS3231 0x68 //I2C address of DS3231
-#include "Wire.h" //for I2C communication
+#include <Wire.h> //for I2C communication
+#include <EEPROM.h> //for saving alarm and settings to EEPROM
 
 //input pins
 const int alarmSw0Pin = A0; //constant alarm switch
@@ -49,14 +52,14 @@ const int ledData = 8; //led driver data
 
 //mode variables
 int mode = 0; //main mode selector
-int oldMode; //previous mode
+int oldMode; //previous mode ***required!?
 boolean changedMode = false; //flag to detect if mode has changed
 int setMode = 1; //settings mode selector
 byte currentSetting[2]; //holds current variables when settings entered
 byte currentSettingMax[2] = {59, 23}; //max mins and hours allowed
-unsigned long lastSet; //time the last button was pressed to adjust a setting
-int setTarget; //target for settings [0=clock, 1=alarm]
-int displayFor = 3000; //time to display alarm before returning to clock
+unsigned long lastSet = 0; //time the last button was pressed to adjust a setting
+int setTarget = 0; //target for settings [0=clock, 1=alarm]
+int displayFor = 3000; //time to display alarm before returning to clock and flash LEDs when confirming setting
 
 //clock variables
 byte clockData[3]; //seconds, minutes, hours
@@ -64,7 +67,6 @@ byte alarm1Data[3]; //seconds, minutes, hours
 byte alarm2Data[2]; //minutes, hours
 byte tempData[2]; //integer, decimal
 byte statusData; //status register
-boolean even; //seconds are even - used to flash various items
 
 //temperature variables
 float temperature[3]; //the current temperature [0=sign, 1=integer, 2=decimal]
@@ -73,7 +75,7 @@ const int tempLogReadings = 10; //number of readings to average
 float tempLog[tempLogReadings]; //readings for average
 int tempLogIndex = 0; //index for average
 float tempLogTotal = 0; //total for average
-int oldSeconds; //to check if the clock has incremented
+int oldSeconds = 0; //to check if the clock has incremented
 
 //led driver variables
 byte ledDisplayByte[3]; //led display data to write back [0=D0-D7, 1=D8-D15, 2=D16-D23]
@@ -84,8 +86,8 @@ int ledDecode = 0; //decode mode - used to turn off banks
 int fadeValue = 0;
 boolean fadeDir = false; //direction of fade
 boolean alarmLed = false; //alarm LED flag
-boolean flashDots = false;
-boolean confirmFlash = false;
+boolean flashDots = false; //flash seperator leds
+boolean confirmFlash = false; //overall confirm flag
 unsigned long confirmFlashTime; //time led flashing started when confirming setting
 
 //button variables
@@ -96,7 +98,7 @@ int buttonState[totalButtons]; //current button state [0=alSw0, 1= alSw1, 2=snSw
 int oldButtonState[totalButtons]; //previous button state
 unsigned long bounceTime[totalButtons]; //millis() times for each button last pressed for debounce
 unsigned long holdTime[totalButtons];
-unsigned long incTime; //time since last increment
+unsigned long incTime = 0; //time since last increment
 int bounceDelay = 40; //debounce time
 int holdDelay = 1000; //time to wait for button hold
 int longHoldDelay = 3000; //time to wait for long button hold **set to same as displayFor? so the alarm write times out
@@ -104,13 +106,15 @@ int incDelay = 80; //time to wait between incrementing during button hold - spee
 
 //alarm variables
 const int totalAlarms = 3; //total software alarms
-int currentAlarm; //currently set alarm
-int displayedAlarm; //currently displayed alarm
-int alarmTime[totalAlarms][2] = { {0, 0}, {5, 7}, {0, 8} }; //array to hold alarm times [mins][hours] ***amend defaults
+int currentAlarm = 99; //currently set alarm. set to 99 as a default, to be changed during setup()
+int displayedAlarm = 0; //currently displayed alarm
+int alarmTime[totalAlarms][2]; //array to hold alarm times [mins, hours]
 boolean alarmStatus[2]; //holds the alarm triggered flags [0=AL1, 1=AL2]
 boolean alarmSet[2]; //holds the alarm set flags [0=AL1, 1=AL2]
 boolean alarmTriggered = false;
-int snoozeFor = 5; //snooze for 5  mins - ***turn into a setting
+int snoozeFor = 10; //snooze time in mins ***store in EEPROM
+int setSnooze; //to store snoozeFor while setting
+int maxSnooze = 20; //maximum settable snoozetime
 
 //alarm tones
 boolean toneActive = false; //is there an active tone
@@ -120,6 +124,8 @@ int toneDelay = 0; //delay between tones
 int toneReps = 0; //cycle through the reps for the sound
 int t; //tone frequency variable
 
+//EEPROM
+int eepromStart = 10; //address in eeprom to store alarms from
 
 void setup() {
   //inputs
@@ -137,101 +143,152 @@ void setup() {
   //initiate wire
   Wire.begin();
 
-  //update alarms **add load from EEPROM here when implemented
+  //update alarms
   getAlarm2();
-  alarmTime[0][0] = bcdToDec(alarm2Data[0] & B01111111); //mins
-  alarmTime[0][1] = bcdToDec(alarm2Data[1] & B00111111); //hours
+
   
+  snoozeFor = EEPROM.read(50); //retrieve snoozeFor setting
+  
+  //read from EEPROM and determine currentAlarm
+  for (int e = 0; e < totalAlarms; e++) {
+    alarmTime[e][0] = EEPROM.read(e + eepromStart); //mins
+    alarmTime[e][1] = EEPROM.read(e + eepromStart + totalAlarms); //hours
+    if (alarmTime[e][0] == bcdToDec(alarm2Data[0] & B01111111) && alarmTime[e][1] == bcdToDec(alarm2Data[1] & B00111111)) { //if current alarm is set in DS3231
+      currentAlarm = e;
+    }
+  }
+  if (currentAlarm == 99) { //if alarm couldn't be determined - eg battery backup removed
+    currentAlarm = 0; //choose alarm 0
+    displayedAlarm = 0; //needed for setEeprom
+    setAlarm2(alarmTime[0][1], alarmTime[0][0]); //set to alarm 0 (hours, mins)
+  }
+
+  resetAlarms(); //so alarm can't trigger on startup
+
   //debugging stuff
-  //  Serial.begin(9600);
-  //  resetAlarms();
+//    Serial.begin(9600);
   //  setTime(0,3,10); //Hours,Mins,Secs
   //  setAlarm1(8,30);
   //  setAlarm2(7,30);
 
+//  for (int s = 0; s<100;s++){
+//    Serial.print(s);
+//    Serial.print(": ");
+//    Serial.println(EEPROM.read(s));
+//  }
+
 }
 
+
 void loop() {
-  
+
   getButtons();
 
   //check for mode change - ***is this still required!?
-//  if (oldMode != mode) changedMode = true;
-//  oldMode = mode; //store previous mode
+  //    if (oldMode != mode) changedMode = true;
+  //    oldMode = mode; //store previous mode
 
   //whilst in a display mode
-  if (mode < 3) {
+  if (mode < 4) {
     if (buttonState[2] == 2) { //if snooze switch released
       mode++; //next display mode
-      if (mode > 2) mode = 0; //loop round
+      if (mode > 3) mode = 0; //loop round
     }
-   if (buttonState[1] == 2) { //if al2 switch released
+    if (buttonState[1] == 2) { //if al2 switch released
       if (alarmSet[0]) mode = 4; //if snoozing - show snoozetime
-      else { 
-        mode = 6; //else show alarm
-        displayedAlarm = currentAlarm; 
+      else {
+        mode = 5; //else show alarm
+        displayedAlarm = currentAlarm;
         changedMode = true;
       }
       lastSet = millis();
     }
   }
 
-  //when alarm displayed
-  if (mode == 6) {
+  //if showing tima and snooze switch long held - go to settings
+  if (mode == 0 && buttonState[2] == 4 && !alarmTriggered) {
+    currentSetting[0] = bcdToDec(clockData[1]); //mins
+    currentSetting[1] = bcdToDec(clockData[2]); //hrs
+    setTarget = 0; //set clock
+    mode = 6; //show settings
+    changedMode = true;
+  }
 
+  //when alarm displayed
+  if (mode == 5) {
     if (buttonState[2] == 1 || buttonState[1] == 1) lastSet = millis(); //if snooze switch pressed, give some extra time to display
-    
-    if (buttonState[1] == 4 && !changedMode) { //if alarm switch long held //****changedMode detection required to ensure writing isn't continuous (EEPROM!!)
+
+    if (buttonState[1] == 4 && !changedMode) { //if alarm switch long held
       setAlarm2(alarmTime[displayedAlarm][1], alarmTime[displayedAlarm][0]); //hrs, mins
       currentAlarm = displayedAlarm;
       lastSet = millis();
-      setTarget = 1;
-      confirm(true);
-      changedMode = true;
+      setTarget = 1; //writing to alarm
+      confirm(true); //do some confirming
+      changedMode = true; //****check this is working! changedMode detection required to ensure writing isn't continuous (EEPROM!!)
     }
     if (buttonState[2] == 4) { //if snooze switch long held
       currentSetting[0] = alarmTime[displayedAlarm][0]; //mins
       currentSetting[1] = alarmTime[displayedAlarm][1]; //hrs
       setTarget = 1; //set alarm
-      mode = 5; //go to settings
+      mode = 6; //go to settings
       changedMode = true;
     }
-    if (buttonState[1] == 2 && !changedMode) { //if al2 switch released
+    if (buttonState[1] == 2 && !changedMode) { //if al2 switch released ** not working - still increments when changedmode
       lastSet = millis();
-//      if (mode != oldMode){
-//        displayedAlarm = currentAlarm; 
-//      } else {
-        displayedAlarm++;
-        if (displayedAlarm > totalAlarms - 1) displayedAlarm = 0;
-//      }
+      displayedAlarm++;
+      if (displayedAlarm > totalAlarms - 1) displayedAlarm = 0;
     }
-    
   }
 
-  if (mode == 5 && !changedMode) { //if in settings mode and not still holding button from entering settings mode
-//  if (mode == 5) { //if in settings mode and not still holding button from entering settings mode  
+  //if in print snooze mode
+  if (mode == 3) {
+    if (buttonState[2] == 4) { //if snooze switch long held
+      setSnooze = snoozeFor;
+      mode = 7;
+      changedMode = true;
+    }
+  }
+
+  //if in snooze settings mode
+  if (mode == 7 && !changedMode) {
+    if (buttonState[2] == 1 || ((buttonState[2] >= 3) && (millis() - incTime > incDelay))) { //if snooze switch pressed or held or longheld and delay since last increment
+      setSnooze += 5; //increment current setting
+      if (setSnooze > maxSnooze) setSnooze = 5; //roll over max 25
+      lastSet = millis(); //set time since last set - so they start flashing after delay
+      incTime = millis(); //set time since last increment - to prevent settings changing too quickly
+    } else if (buttonState[1] == 2) { //if al2 switch released. else used incase both buttons held together
+      snoozeFor = setSnooze; //update snoozeFor
+      EEPROM.update(50, snoozeFor); //save setting to EEPROM
+      mode = 3; //change to view mode
+      confirm(true);
+      setTarget = 2;
+    }
+  }
+
+  //if in settings mode (and not still holding button from entering settings mode)
+  if (mode == 6 && !changedMode) {
     if (buttonState[2] == 1 || ((buttonState[2] >= 3) && (millis() - incTime > incDelay))) { //if snooze switch pressed or held or longheld and delay since last increment
       currentSetting[setMode]++; //increment current setting
       if (currentSetting[setMode] > currentSettingMax[setMode]) currentSetting[setMode] = 0; //wrap current setting
       lastSet = millis(); //set time since last set - so they start flashing after delay
       incTime = millis(); //set time since last increment - to prevent settings changing too quickly
-    } else if (buttonState[1] == 2) { //if al2 switch pressed. else used incase both buttons held together
+    } else if (buttonState[1] == 2) { //if al2 switch released. else used incase both buttons held together
       setMode--; //goto next setting
       if (setMode < 0) { //if past end of settings - save and exit
         setMode = 1; //reset mode pointer
         confirm(true);
-//        changedMode = true; //flag mode has changed
+        //        changedMode = true; //flag mode has changed
         switch (setTarget) { //determines target for settings
           case 0: //clock
-            setTime(currentSetting[1], currentSetting[0], 0);
+            setTime(currentSetting[1], currentSetting[0], 0); //hours, mins, secs
             mode = 0;
             break;
           case 1: //alarm
-            setAlarm2(currentSetting[1], currentSetting[0]); //write to DS3231
+            setAlarm2(currentSetting[1], currentSetting[0]); //write to DS3231 (hours, mins)
             alarmTime[displayedAlarm][0] = currentSetting[0]; //update alarm mins
             alarmTime[displayedAlarm][1] = currentSetting[1]; //update alarm hrs
             currentAlarm = displayedAlarm; //update current alarm
-            mode = 6; //display alarm
+            mode = 5; //display alarm
             lastSet = millis(); //save time of setting so alarm can be displayed for a short while
             break;
         }
@@ -239,19 +296,9 @@ void loop() {
     }
   }
 
-  //when confirm flash has finished - reset
-  if (millis() - confirmFlashTime > displayFor) confirm(false);
 
-  //if snooze switch long held on time - go to settings
-  if (mode == 0 && buttonState[2] == 4 && !alarmTriggered) {
-    currentSetting[0] = bcdToDec(clockData[1]); //mins
-    currentSetting[1] = bcdToDec(clockData[2]); //hrs
-    setTarget = 0; //set clock
-    mode = 5; //show settings
-  }
-
-  //if alarm displayed without button press, timeout and return to clock
-  if ((mode == 4 || mode == 6) && (millis() - lastSet > displayFor)) mode = 0;
+  //if alarm or snooze displayed without button press, timeout and return to clock
+  if ((mode == 4 || mode == 5) && (millis() - lastSet > displayFor)) mode = 0;
 
   //if setting displayed without button press for 30 seconds, return to clock
   //  if ((mode == 5 && (millis() - lastSet > 30000)) mode = 0;
@@ -265,7 +312,7 @@ void loop() {
   }
 
   //if exiting settings do not trigger alarm - needed incase time is set to alarm time
-  if (oldMode == 5 && mode == 0) resetAlarms();
+  if (oldMode == 6 && mode == 0) resetAlarms();
 
   //if alarm currently triggered
   if (alarmTriggered) {
@@ -281,7 +328,7 @@ void loop() {
   } else alarmSounds(0);
 
   //if alarm switch toggled off and currently in settings - exit setting
-  if (mode == 5 && buttonState[0] == 1 && oldButtonState[0] == 0) mode = 0;
+  if ((mode == 6 || mode == 7) && buttonState[0] == 1 && oldButtonState[0] == 0) mode = 0;
 
   //alarm switch
   if (buttonState[0] == 0) { //if al1 switch on
@@ -296,6 +343,9 @@ void loop() {
     }
     //    alarmSounds(0); //testing
   }
+
+  //when confirm flash has finished - reset
+  if (millis() - confirmFlashTime > displayFor) confirm(false);
 
   getTime();
   getTemp();
@@ -313,21 +363,23 @@ void loop() {
       printSeconds();
       break;
     case 2:
-    printAlarm2();
 //      printTemp();
+      printAlarm2(); //testing
       break;
     case 3:
-      printAlarm2(); //change to printSnooze
+      printSnooze(false); //change to printSnooze - not setting
       break;
     case 4:
-      printSnooze(); //change to printSetSnooze
+      printSnoozeRemain(); //show time left whilst snoozing
       break;
     case 5:
-      printSetting();
+      printAlarm(displayedAlarm);
       break;
     case 6:
-      printAlarm(displayedAlarm);
-//      printAlarm2(); //change to currently set alarm
+      printSetting();
+      break;
+    case 7:
+      printSnooze(true); //change to printSnooze and set
       break;
   }
 
@@ -348,6 +400,18 @@ byte bcdToDec (byte val) {
 //convert decimal to BCD
 byte decToBcd (byte val) {
   return ((val / 10) << 4) | (val % 10);
+}
+
+//check if seconds is even - for flashing
+boolean even() {
+  if (clockData[0] % 2) return true; //if seconds are even
+  else return false;
+}
+
+//deci-even - for fast flashing of various items
+boolean dEven() {
+  if ((millis() / 100) % 2) return true; //if millis() / 100
+  else return false;
 }
 
 //add 12hour mode?
@@ -379,6 +443,7 @@ void setAlarm2(int hours, int mins) {
   Wire.write(B10000000); //masked A2M4 so alarm looks for match on hours and mins
   //  Wire.write(B01000000 | day); //day of week, masked DY/DT so alarm looks for match on dayofweek, hours, mins
   Wire.endTransmission();
+  setEeprom(bcdToDec(mins), bcdToDec(hours), displayedAlarm); //save to EEPROM
 }
 
 void resetAlarms() {
@@ -433,6 +498,11 @@ void snooze() {
 //  tempData[1] = Wire.read() >> 6; //decimal, shift right as only bytes 7 and 8 are used, +-0.25 accuracy
 //}
 
+void setEeprom (int m, int h, int al) { //mins, hours, alarm target
+  EEPROM.update(al + eepromStart, m); //mins
+  EEPROM.update(al + eepromStart + totalAlarms, h); //hours
+}
+
 void getTime() {
   Wire.beginTransmission(DS3231);
   Wire.write(0x00); //read from byte 0 (seconds)
@@ -441,8 +511,6 @@ void getTime() {
   for (int i = 0; i < 3; i++) {
     clockData[i] = Wire.read();
   }
-  if (clockData[0] % 2) even = false; //check if seconds is even - for flashing
-  else even = true;
 }
 
 void getAlarm1() {
@@ -553,17 +621,32 @@ void printSeconds() {
 }
 
 //display time left to snooze
-void printSnooze() {
-  ledDecode = 34; //turn off banks 3 & 4
+void printSnoozeRemain() {
   int snoozeLeft = bcdToDec((alarm1Data[1] & B01111111)) - bcdToDec(clockData[1]); //mins
-  if (snoozeLeft < 0) snoozeLeft += 60; //rollover
+  //  if (snoozeLeft < 0) snoozeLeft += 60; //rollover ***is this needed now snooze is in mins!?
   ledDisplayByte[2] = dots(false, true, false); //no decimal points, dots on
   ledDisplayByte[1] = 0;
   ledDisplayByte[0] = decToBcd(snoozeLeft);
-  //  if (millis() - lastSet > 3000) mode = 0; //if displayed for more than 3 seconds without button press, return to clock
+  if (snoozeLeft / 10 == 0) ledDecode = 234; //if leading zero, turn bank 2, 3 & 4 off
+  else ledDecode = 34; //turn off banks 3 & 4
 }
 
-//*** add additional alarms here? or in the settings?
+//set time to snooze for
+void printSnooze(boolean set) {
+  ledDisplayByte[2] = dots(true, false, false); //decimal points on, dots off
+  ledDisplayByte[1] = B01010110; //blank the left hand digits
+  if (set) ledDisplayByte[0] = decToBcd(setSnooze); //if setting
+  else ledDisplayByte[0] = decToBcd(snoozeFor);
+  if (bcdToDec(ledDisplayByte[0]) / 10 == 0) ledDecode = 923; //special decode on banks 2 & 3 to allow n and blanking
+  else ledDecode = 93; //special on 3
+
+  if ((millis() - lastSet > 1000 && even() && set) || (confirmFlash && dEven())) { //if setting and buttons not pressed and none have been pressed for over 1 second, or confirming, begin flashing
+    ledDisplayByte[0] = 0; //set mins digit to 0
+    ledDecode = 9123; //special on banks 9, 2 & 3
+  }
+}
+
+//print alarm from RTC ***only required for testing now
 void printAlarm2() {
   ledDisplayByte[2] = dots(false, true, false); //no decimal points, dots on
   ledDisplayByte[1] = alarm2Data[1] & B00111111; //hours
@@ -571,11 +654,8 @@ void printAlarm2() {
   if (bcdToDec(alarm2Data[1]) / 10 == 0) ledDecode = 4; //if leading zero, turn bank 4 off
   else ledDecode = 0;
 }
-//
-//const int totalAlarms = 3; //total software alarms
-//int currentAlarm; //currently set alarm
-//int alarmTime[totalAlarms][2] = { {11, 1}, {22, 2}, {33, 3} }; //array to hold alarm times [mins][hours]
 
+//print alarm from EEPROM
 void printAlarm(int al) {
   ledDisplayByte[2] = dots(false, true, false); //no decimal points, dots on
   ledDisplayByte[1] = decToBcd(alarmTime[al][1]); //hours
@@ -592,7 +672,7 @@ void printSetting() {
   if (currentSetting[1] / 10 == 0) ledDecode = 4; //if leading zero, turn bank 4 off
   else ledDecode = 0;
 
-  if (millis() - lastSet > 1000 && even) { //if buttons not pressed and none have been pressed for over 1 second, begin flashing
+  if (millis() - lastSet > 1000 && even()) { //if buttons not pressed and none have been pressed for over 1 second, begin flashing
     switch (setMode) {
       case 1:
         ledDisplayByte[1] = 0; //set hrs digit to 0
@@ -611,7 +691,7 @@ void printSetting() {
 void printTemp() {
   ledDisplayByte[2] = dots(true, false, false); //decimal point on, dots off
   ledDisplayByte[1] = decToBcd(int(currentTemp)); //left hand digits
-  ledDisplayByte[0] = (int(currentTemp * 10) % 10) << 4 | B1100; //right hand digit with upper case C character
+  ledDisplayByte[0] = (int(currentTemp * 10) % 10) << 4 | B1100; //right hand digit with upper case C character (12)
   //  ledDisplayByte[0] = (int(currentTemp*10)%10) << 4 | B0001; //right hand digit with lower case C character - requires special decode
   if (int(currentTemp) / 10 == 0) ledDecode = 4; //if leading zero in left hand digit, turn off bank 4
   else ledDecode = 0;
@@ -640,13 +720,25 @@ void updateDisplay() {
     case 124:
       ledControlByte |= B00010110; //no decode on banks 1, 2 & 4
       break;
+    case 234:
+      ledControlByte |= B00011100; //no decode on banks 2, 3 & 4
+      break;
+    case 93:
+      ledControlByte |= B01001000; //special decode on bank 3
+      break;
+    case 923:
+      ledControlByte |= B01001100; //special decode on banks 2 & 3
+      break;
+    case 9123:
+      ledControlByte |= B01001110; //special decode on banks 2, 3 & 4
+      break;
   } //else no additional decode
   oldLedByte[3] = ledDecode; //store new control byte decode
 
   //enable low power mode - fixes glitchiness when switching between decode modes
-  digitalWrite(ledEnable, LOW); //set enable pin to low to enable writing
-  shiftOut(ledData, ledClock, MSBFIRST, 0);
-  digitalWrite(ledEnable, HIGH); //update with new data
+  //  digitalWrite(ledEnable, LOW); //set enable pin to low to enable writing
+  //  shiftOut(ledData, ledClock, MSBFIRST, 0);
+  //  digitalWrite(ledEnable, HIGH); //update with new data
 
   //write to display register
   digitalWrite(ledEnable, LOW);
@@ -670,32 +762,34 @@ void updateLeds() {
 
   if (alarmTriggered) {
     analogWrite (snoozeLedPin, fadeValue); //fade snooze LED
-    if ((millis() / 100) % 2) alarmLed = true; //flash alarm led
+    if (dEven()) alarmLed = true; //flash alarm led
     else alarmLed = false;
 
   } else { //if alarm not triggered
     if (alarmSet[0]) analogWrite (snoozeLedPin, fadeValue); //if snoozing - fade snooze led
     else analogWrite (snoozeLedPin, 0);
 
-    if (mode == 5 && setTarget == 1) { //if setting alarm
-      if (even) alarmLed = false; //flash alarm led slowly
+    if (mode == 6 && setTarget == 1) { //if setting alarm
+      if (even()) alarmLed = false; //flash alarm led slowly
       else alarmLed = true;
     } else if (confirmFlash && (millis() - confirmFlashTime < displayFor)) {  //if confirming setting
-      if (setTarget == 0) { //if time was set
-        if ((millis() / 100) % 2) flashDots = true; //flash dots
-        else flashDots = false;
-      }
-      if (setTarget == 1) { //if alarm was set
-        flashDots = true; //dots should be on whilst flashing alarm confirm
-        if ((millis() / 100) % 2) alarmLed = true; //flash alarm led
-        else alarmLed = false;
+      switch (setTarget) {
+        case 0: //if time was set
+          if (dEven()) flashDots = true; //flash dots
+          else flashDots = false;
+          break;
+        case 1: //if alarm was set
+          flashDots = true; //dots should be on whilst flashing alarm confirm
+          if (dEven()) alarmLed = true; //flash alarm led
+          else alarmLed = false;
+          break;
       }
     } else if (alarmSet[1]) alarmLed = true; //if alarm turned on, activate alarm led
     else alarmLed = false;
   }
 }
 
-//reset the fadin of the snooze LED
+//reset the fading of the snooze LED
 void resetFade() {
   fadeValue = 0;
   fadeDir = 0;
@@ -714,7 +808,7 @@ byte dots(boolean decimal, boolean separator, boolean flash) { //[1XX = decimal 
   byte b = B10000000; //full brightness
   if (decimal) b |= B00110000; //bank 3 decimal point
   if (alarmLed) b |= B00000010; //alarm led
-  if ((confirmFlash && flashDots) || (!confirmFlash && (separator || (flash && even)))) b |= B00000100; //separator dots
+  if ((confirmFlash && flashDots) || (!confirmFlash && (separator || (flash && even())))) b |= B00000100; //if confirming with dots, or flashing dots or dots on
   return b;
 }
 
