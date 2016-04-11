@@ -6,20 +6,24 @@
    TODO:
 
    Hardware
-    breadboard arduino
-    usb power
+    replace the arduino with ATMEGA chip and required accessories
+    usb power - any electrical considerations? polyfuse?
+    mounting of the usb power socket
     jumper to select between usb power or ICSP
-    switch or jumper to disable sound
+    include a switch or jumper to disable sound?
     change the LED display to one unit?
+    led display isn't as bright as it could be - resistor mathmatics required...
+    protect the display with clear or slighly smoked acrylic (brightness!!)
 
    Software
-    improve alarm tones
+    improve alarm tones - use alarmStarted time to increase the tone?
     add negative for temperature?
-    settings mode for alarm tone?
+    settings mode for alarm tones?
     settings mode for 12/24h mode?
     automatically exit settings mode if no buttons pressed for a while?
-    combine dots into the updateLeds function?
     implement pointers
+    implement transitions between display modes **develop this further/properly
+    look for unused variables and remove
 
    Bugs
     confirmFlash continues even when mode is changed
@@ -110,7 +114,7 @@ int snoozeFor; //snooze time in mins - will read from EEPROM
 int setSnooze; //to store snoozeFor while setting
 int maxSnooze = 20; //maximum settable snoozetime
 unsigned long alarmStarted; //time alarm started sounding
-unsigned int alarmStop = 600000; //alarm to stop itself after 10 mins
+unsigned long alarmStop = 10 * 60000; //alarm to stop itself after 10 mins
 
 //alarm tones
 boolean toneActive = false; //is there an active tone
@@ -161,7 +165,7 @@ void setup() {
   resetAlarms(); //so alarm can't trigger on startup
 
   //debugging stuff
-  //    Serial.begin(9600);
+//      Serial.begin(9600);
   //  setTime(0,3,10); //Hours,Mins,Secs
   //  setAlarm1(8,30);
   //  setAlarm2(7,30);
@@ -187,7 +191,8 @@ void loop() {
     if (buttonState[1] == 2) { //if al2 switch released
       if (alarmSet[0]) mode = 4; //if snoozing - show snoozetime
       else {
-        mode = 5; //else show alarm
+//        mode = 5; //else show alarm
+        printTransition(); // testing
         displayedAlarm = currentAlarm;
         changedMode = true;
       }
@@ -331,7 +336,7 @@ void loop() {
     //    alarmSounds(0); //testing
   }
 
-  //if alarm has sounded without cancel for too long
+  //if alarm has sounded without cancel for too long ** fix this!
   if (alarmTriggered && millis() - alarmStarted > alarmStop) resetAlarms();
 
   //when confirm flash has finished - reset
@@ -354,7 +359,6 @@ void loop() {
       break;
     case 2:
       printTemp();
-      //      printAlarm2(); //testing
       break;
     case 3:
       printSnooze(false); //show snooze setting - display only
@@ -662,11 +666,68 @@ void printTemp() {
   else ledDecode = 0;
 }
 
+//transition between display modes
+void printTransition() {
+  int del = 50;
+  byte oldT[3];
+  byte newT[3];
+  for (int d = 0; d < 3; d++) {
+    oldT[d] = ledDisplayByte[d];
+  }
+  
+  printAlarm(displayedAlarm); //update ledDisplay byte with new values
+
+  for (int e = 0; e < 3; e++) {
+    newT[e] = ledDisplayByte[e];
+  }
+  
+  ledDisplayByte[2] = dots(false, false, false); //keep dots off
+  ledDisplayByte[1] = oldT[1] >> 4;
+  ledDisplayByte[0] = (oldT[0] >> 4) | (oldT[1] << 4);
+  ledDecode = 4;
+  updateDisplay();
+  delay(del);
+  
+  ledDisplayByte[1] = 0;
+  ledDisplayByte[0] = oldT[1];
+  ledDecode = 34;
+  updateDisplay();
+  delay(del);
+
+  ledDisplayByte[0] = oldT[1] >> 4;
+  ledDecode = 234;
+  updateDisplay();
+  delay(del);
+
+  ledDisplayByte[1] = newT[0] << 4;
+  ledDisplayByte[0] = 0;
+  ledDecode = 123;
+  updateDisplay();
+  delay(del);
+  
+  ledDisplayByte[1] = newT[0];
+  ledDecode = 12;
+  updateDisplay();
+  delay(del);
+
+  ledDisplayByte[1] = newT[1] << 4 | (newT[0] >> 4);
+  ledDisplayByte[0] = newT[0] << 4;
+  ledDecode = 1;
+  updateDisplay();
+  delay(del);
+
+  mode = 5;
+  
+}
+
 //write to the display
 void updateDisplay() {
   int ledControlByte;
-  ledControlByte = B00100001; //low power mode off, no decode on bank 5 only
+  ledControlByte = B11100001; //low power mode off, no decode on bank 5 only
   switch (ledDecode) { //no decode extension modes
+     case 1:
+      ledControlByte |= B00000010; //no decode on bank 1
+      break;
     case 2:
       ledControlByte |= B00000100; //no decode on bank 2
       break;
@@ -682,11 +743,17 @@ void updateDisplay() {
     case 34:
       ledControlByte |= B00011000; //no decode on banks 3 & 4
       break;
+    case 123:
+      ledControlByte |= B00001110; //no decode on banks 1, 2 & 3
+      break;      
     case 124:
       ledControlByte |= B00010110; //no decode on banks 1, 2 & 4
       break;
     case 234:
       ledControlByte |= B00011100; //no decode on banks 2, 3 & 4
+      break;
+    case 1234:
+      ledControlByte |= B00011110; //no decode on banks 1, 2, 3 & 4
       break;
     case 93:
       ledControlByte |= B01001000; //special decode on bank 3
@@ -709,7 +776,7 @@ void updateDisplay() {
   digitalWrite(ledEnable, LOW);
   for (int d = 2; d >= 0; d--) {
     shiftOut(ledData, ledClock, MSBFIRST, ledDisplayByte[d]); // shift out brightness, decimal points and other leds data
-    oldLedByte[d] = ledDisplayByte[d];
+    oldLedByte[d] = ledDisplayByte[d]; //store existing value
   }
   digitalWrite(ledEnable, HIGH);
 }
@@ -766,10 +833,25 @@ void confirm(boolean activate) {
 
 //control of bank 5 and decimal points
 byte dots(boolean decimal, boolean separator, boolean flash) { //[1XX = decimal point on, X1X = dots on, X01 = flashing dots]
+  int d = 0;
   byte b = B10000000; //full brightness
   if (decimal) b |= B00110000; //bank 3 decimal point
-  if (alarmLed) b |= B00000010; //alarm led
-  if ((confirmFlash && flashDots) || (!confirmFlash && (separator || (flash && even())))) b |= B00000100; //if confirming with dots, or flashing dots or dots on
+//  if (alarmLed) b |= B00000010; //alarm led
+//  if ((confirmFlash && flashDots) || (!confirmFlash && (separator || (flash && even())))) b |= B00000100; //if confirming with dots, or flashing dots or dots on
+  if (alarmLed) d += 1; //alarm led
+  if ((confirmFlash && flashDots) || (!confirmFlash && (separator || (flash && even())))) d +=2 ; //if confirming with dots, or flashing dots or dots on
+  switch (d) {
+    case 1:
+      b |= B00001000;
+      break;
+    case 2:
+      b |= B00000011;
+      break;
+    case 3:
+      b |= B00000010;
+      break;
+  }
+
   return b;
 }
 
